@@ -1,0 +1,381 @@
+안심온 ClawOps 전화 모듈 개발 워크플로우
+=========================================
+
+문서 목적
+---------
+이 문서는 오프라인 해커톤 최종 기획안에서 전화 담당자가 구현할 범위만 정리한 단일 기준 문서다.
+전화는 제품의 끝이 아니라 다음 폐쇄형 흐름의 중간 실행 채널이다.
+
+위험 예측 → 행동지침·쉼터 확정 → 담당자 승인 → ClawOps 예방 전화
+→ 응답 구조화 → Spring 결과 저장 → 지원 업무 생성 또는 완료
+→ 무응답이면 10분 뒤 정확히 1회 재전화
+
+범위 밖
+-------
+- ML 위험도 계산
+- RAG 근거 검색과 쉼터 선정
+- 관리자 화면 구현
+- AI의 의료 진단
+- AI의 119 자동 신고
+- 관리자 승인 없는 인력 배치
+
+
+1. 가장 중요한 책임 경계
+=========================
+
+[Spring Boot가 결정할 것]
+- 자동전화 동의 여부와 철회 여부 확인
+- 연락 허용 시간 확인
+- 최종 승인된 interventionPlan 생성
+- contactJob 생성, 멱등키 검사, 발신 예약
+- 전화 모듈 실행 요청
+- 결과 스키마 검증과 저장
+- 첫 무응답 종료 시각 + 10분으로 1회 재시도 예약
+- 지원 업무 생성과 대시보드 반영
+
+[ClawOps 전화 모듈이 할 것]
+- 승인된 계획을 읽고 지정된 한 명에게 한 번 발신
+- AI임과 통화 목적을 첫 문장에 알림
+- 승인된 위험 시간·행동지침·쉼터 사실만 말함
+- 한 번에 질문 하나씩 진행
+- 답변이 불명확하면 한 번만 재질문
+- 통화 결과를 정해진 enum으로 구조화
+- 통화 종료 결과를 Spring에 한 번 이상 안전하게 전달
+- 긴급 증상 언급 시 사람 확인 플래그를 즉시 올림
+
+[전화 모듈이 결정하면 안 되는 것]
+- 누구에게 전화할지
+- 위험 등급과 추천 쉼터를 새로 계산하는 것
+- 지원 업무 우선순위를 임의로 바꾸는 것
+- 무응답 재시도 시각을 자체 스케줄링하는 것
+- 자유문장만 반환하고 백엔드가 다시 추측하게 하는 것
+
+
+2. 통합 데이터 계약
+===================
+
+2.1 Spring → 전화 모듈 입력
+---------------------------
+구현 전에 아래 JSON 계약을 팀과 고정한다. 실제 필드명은 팀 합의 후 바꾸더라도 의미는 유지한다.
+
+{
+  "contactJobId": 991,
+  "attemptNo": 1,
+  "toNumber": "01012345678",
+  "elderlyDisplayName": "김OO",
+  "preferredLanguage": "ko",
+  "speechRate": "slow",
+  "riskLevel": "HIGH",
+  "riskWindow": "오늘 오후 1시부터 5시까지",
+  "guidance": [
+    "오후 1시 전부터 시원한 실내에 머물러 주세요.",
+    "물을 조금씩 자주 드세요."
+  ],
+  "shelter": {
+    "name": "OO경로당 무더위쉼터",
+    "address": "서울특별시 ...",
+    "travelMinutes": 8,
+    "openStatus": "OPEN"
+  },
+  "questions": [
+    "쉼터에 가실 의향이 있으신가요?",
+    "혼자 이동하실 수 있으신가요?",
+    "이동이나 다른 도움이 필요하신가요?"
+  ],
+  "planVersion": 1
+}
+
+입력 검증 실패 시 발신하지 않는다.
+- contactJobId, attemptNo, toNumber가 있어야 한다.
+- interventionPlan은 승인 상태여야 한다.
+- guidance와 questions는 빈 배열이면 안 된다.
+- 쉼터가 닫혔거나 핵심 데이터가 오래됐으면 발신하지 않는다.
+- 전화번호, 동의 상태, 연락 허용 시간은 Spring에서 최종 확인한다.
+
+2.2 전화 모듈 → Spring 결과
+----------------------------
+최종 Notion 기획안의 통화 결과 스키마를 기준으로 한다.
+
+{
+  "contactJobId": 991,
+  "contactStatus": "ANSWERED",
+  "shelterIntent": "YES",
+  "canMoveAlone": "NO",
+  "helpNeeded": "YES",
+  "symptomMentioned": "NO",
+  "summary": "쉼터 이동 의향이 있으나 혼자 이동하기 어렵다고 답변함.",
+  "transcriptRef": "restricted://call/991/attempt/1",
+  "confidence": 0.93,
+  "endedAt": "2026-08-14T15:20:00+09:00"
+}
+
+허용 enum
+- contactStatus: ANSWERED | NO_ANSWER | FAILED
+- shelterIntent: YES | NO | UNKNOWN
+- canMoveAlone: YES | NO | UNKNOWN
+- helpNeeded: YES | NO | UNKNOWN
+- symptomMentioned: YES | NO | UNKNOWN
+
+운영 메타데이터는 결과 본문과 분리해 함께 저장한다.
+- provider = CLAWOPS
+- providerCallId
+- attemptNo = 1 또는 2
+- planVersion
+- receivedAt
+
+주의
+- 답을 듣지 못한 필드는 추측하지 않고 UNKNOWN으로 둔다.
+- 요약은 담당자용 2~3문장으로 제한한다.
+- 원본 녹취를 이벤트 본문에 싣지 말고 권한이 통제된 transcriptRef만 전달한다.
+- 백엔드는 enum, 필수 필드, contactJobId 존재 여부를 검증한 뒤 저장한다.
+
+2.3 결과 콜백 멱등성
+--------------------
+권장 멱등키:
+contactJobId + attemptNo + eventType
+
+같은 콜백이 여러 번 들어와도 call_observation과 support_task는 한 번만 생성해야 한다.
+ClawOps SDK의 HTTP 재시도와 서비스의 '10분 후 재전화'는 서로 다른 개념이다.
+업무 재전화는 반드시 Spring 상태 머신만 예약한다.
+
+
+3. 통화 대화 흐름(목표 60~90초)
+================================
+
+1) 시작
+   "안녕하세요. 안심온 AI 안부확인 서비스입니다.
+    현재 폭염 위험이 높아 안전 확인과 예방 안내를 위해 연락드렸습니다."
+
+2) 통화 가능 여부 확인
+   지금 잠시 통화 가능한지 한 문장으로 묻는다.
+   잘못 연결됐거나 연락 거부 의사가 있으면 즉시 종료하고 사람이 확인할 수 있게 기록한다.
+
+3) 승인된 안내
+   - 위험이 커지는 시간
+   - 핵심 예방 행동 최대 2개
+   - 운영 중인 추천 쉼터 1곳과 이동시간
+   숫자, 주소, 운영시간을 모델이 새로 만들지 못하게 한다.
+
+4) 확인 질문
+   - 쉼터에 가실 의향이 있는지
+   - 혼자 이동할 수 있는지
+   - 이동이나 다른 도움이 필요한지
+   한 번에 질문 하나만 한다.
+
+5) 안전 신호 확인
+   통화 중 어지럼증, 심한 두통, 구역질, 의식 저하 등 증상이 언급되면
+   symptomMentioned=YES로 기록하고 사람의 즉시 확인을 요청한다.
+   AI는 진단하지 않으며 승인된 안전 문구만 읽는다.
+
+6) 답변 재확인
+   "쉼터에는 가고 싶지만 혼자 이동은 어렵고 도움이 필요하신 것으로 확인했습니다. 맞으실까요?"
+   핵심 답을 짧게 한 번 되읽는다.
+
+7) 종료
+   후속 확인이 필요한 경우 담당자에게 전달하겠다고 알리고 종료한다.
+
+음성 UX 규칙
+- 느리고 짧은 한국어 문장
+- 질문 하나, 답변 하나
+- 끼어들기(barge-in)를 허용
+- STT/의도 신뢰도가 낮으면 같은 질문을 쉬운 말로 한 번만 재질문
+- 두 번째도 불명확하면 UNKNOWN
+- DTMF는 음성 인식 실패 때 예/아니오 보조 수단으로만 사용
+- 이름, 질환 등 불필요한 개인정보를 프롬프트에 넣지 않음
+
+
+4. 상태와 재시도 규칙
+=====================
+
+PENDING
+  → READY_FOR_REVIEW     안내 계획 생성
+  → SCHEDULED            자동 정책 또는 담당자 승인
+  → CALLING              예약 시각 도달
+
+CALLING 결과
+- 연결 및 결과 수집: ANSWERED → ANALYZED
+- 첫 무응답: RETRY_SCHEDULED, nextAttemptAt = 첫 시도 종료 + 10분
+- 두 번째 무응답: UNCONFIRMED → HIGH 수동 확인 업무
+- 기술 오류: FAILED → 운영자 확인 업무
+
+ANALYZED 결과
+- helpNeeded=YES: HIGH 지원 업무
+- shelterIntent=YES + canMoveAlone=NO: HIGH 쉼터 이동 지원
+- symptomMentioned=YES: CRITICAL 즉시 사람 확인
+- 응답 필드가 UNKNOWN: MEDIUM 수동 확인
+- 별도 지원 불필요: COMPLETED
+
+재시도 불변 규칙
+- 무응답일 때만 재전화한다.
+- 첫 무응답 후 정확히 10분 뒤 한 번만 재전화한다.
+- 10분 뒤가 허용 연락시간 밖이면 자동 재전화하지 않고 수동 확인으로 넘긴다.
+- 같은 대상자·위험 스냅샷·연락 목적의 완료 통화가 있으면 새 작업을 만들지 않는다.
+- 기술 오류를 무응답으로 위장하지 않는다.
+
+
+5. ClawOps 구현 순서
+===================
+
+Phase 0. 계약 고정
+------------------
+[ ] 2장의 입력·출력 JSON을 백엔드 담당자와 확정
+[ ] enum과 UNKNOWN 처리 규칙 확정
+[ ] 결과 콜백 URL과 인증 방식 확정
+[ ] 10분 재시도 책임이 Spring임을 확정
+
+Phase 1. 계정·로컬 준비
+----------------------
+[ ] Python 3.10 이상 가상환경 생성
+[ ] pip install "clawops[agent,openai]"
+[ ] ClawOps API Key, Account ID, 070 번호 준비
+[ ] OpenAI API Key 준비
+[ ] .env.example을 참고해 기존 .env에 누락된 항목만 추가하기(기존 키를 덮어쓰지 않음)
+[ ] python scripts/provision_number.py 로 보유 번호와 키 확인
+[ ] 의존성 버전은 첫 성공 후 requirements.txt에 고정
+
+필수 환경변수
+- CLAWOPS_API_KEY
+- CLAWOPS_ACCOUNT_ID
+- CLAWOPS_FROM_NUMBER
+- OPENAI_API_KEY
+
+현재 정리 시점의 기존 .env에는 위 네 항목이 없으므로 Phase 1에서 직접 발급·추가해야 한다.
+
+Phase 2. 네트워크 없는 전화 어댑터 테스트
+-----------------------------------------
+[ ] 입력 계약 validator 작성
+[ ] 결과 enum validator 작성
+[ ] 질문별 YES/NO/UNKNOWN 변환 테스트
+[ ] 결과→지원업무 규칙 테스트
+[ ] 동일 콜백 2회 수신 멱등성 테스트
+[ ] 첫 무응답 + 10분 계산 테스트
+
+권장 새 코드 구조
+voice/
+  schemas.py              입력·결과 모델과 enum
+  prompt.py               고령자용 대화 규칙
+  clawops_adapter.py       ClawOps 연결과 1회 발신
+  result_callback.py       Spring 결과 전송
+tests/
+  test_schemas.py
+  test_outcome_mapping.py
+  test_retry_policy.py
+
+Phase 3. 실제 팀원 휴대전화 PoC
+------------------------------
+[ ] 테스트 번호와 명시적 동의만 사용
+[ ] agent.call(toNumber)로 1건 발신
+[ ] 한국어 첫 음성 지연 측정
+[ ] 끼어들기, 느린 말, 침묵, 사투리, 잡음 테스트
+[ ] 각 질문의 구조화 필드가 정확히 채워지는지 확인
+[ ] 재질문은 최대 한 번인지 확인
+[ ] 통화 종료 후 agent.disconnect()가 항상 실행되는지 확인
+
+공식 문서의 기본 형태
+- ClawOpsAgent(from_=발신번호, session=OpenAIRealtime(...))
+- await agent.call(수신번호, timeout=...)
+- await call.wait()
+- await agent.disconnect()
+- @agent.tool로 구조화 결과 수집 함수를 등록
+
+Phase 4. Spring 통합
+-------------------
+[ ] Spring이 승인된 contactJob만 전화 모듈에 전달
+[ ] 전화 모듈이 결과 콜백 전송
+[ ] Spring이 스키마와 멱등키 검증 후 저장
+[ ] 결과 규칙에 따라 support_task 생성
+[ ] providerCallId와 attemptNo 저장
+[ ] 로그의 전화번호는 뒤 4자리만 남기고 마스킹
+
+Phase 5. 무응답·장애
+-------------------
+[ ] 1차 무응답을 NO_ANSWER로 저장
+[ ] Spring이 종료 시각 + 10분으로 2차 시도 예약
+[ ] 2차 무응답을 UNCONFIRMED로 마감
+[ ] 인증 실패, 번호 오류, ClawOps 장애를 FAILED로 분리
+[ ] 결과 콜백 실패 시 안전한 제한 재전송
+[ ] 중복 발신 방지 잠금 테스트
+
+Phase 6. 해커톤 데모
+-------------------
+[ ] 가상 대상자만 사용
+[ ] HIGH 위험 → 승인 → 실제 전화 수신
+[ ] "쉼터에 가고 싶지만 혼자 못 가고 도움이 필요하다"고 응답
+[ ] 통화 결과가 대시보드에 표시
+[ ] HIGH 지원 업무가 한 번만 생성
+[ ] 별도 시나리오로 첫 무응답 → 10분 뒤 1회 재전화 표시
+
+
+6. 완료 기준
+============
+
+[ ] 동의가 없거나 철회된 대상자에게 발신하지 않는다.
+[ ] 승인된 계획의 위험 시간, 예방 행동, 쉼터만 말한다.
+[ ] 세 가지 핵심 질문을 한 번에 하나씩 묻는다.
+[ ] 통화 결과가 5개 enum 필드와 요약으로 저장된다.
+[ ] 낮은 신뢰도는 추측하지 않고 UNKNOWN으로 저장된다.
+[ ] 도움 필요 또는 이동 곤란이면 지원 업무가 자동 생성된다.
+[ ] 증상 언급이면 CRITICAL 사람 확인으로 연결된다.
+[ ] 첫 무응답 10분 뒤 한 번만 재전화한다.
+[ ] 두 번째 무응답이면 HIGH 수동 확인 업무가 생성된다.
+[ ] 중복 이벤트에도 전화·관찰·지원 업무가 중복 생성되지 않는다.
+[ ] 전화번호, API Key, 녹취 원문이 로그에 노출되지 않는다.
+
+
+7. 개발 중 자주 헷갈리는 점
+==========================
+
+- ClawOps SDK 내부 HTTP 재시도와 10분 뒤 업무 재전화는 다르다.
+- ClawOps는 통화 채널이고, 업무 상태 머신의 주인은 Spring이다.
+- OpenAI Realtime은 승인된 사실을 말하고 답을 구조화할 뿐 위험도나 쉼터를 결정하지 않는다.
+- 통화가 연결됐다고 결과가 완성된 것은 아니다. 미확인 필드는 UNKNOWN으로 남긴다.
+- AI가 긴급성을 느껴도 의료 판단이나 119 자동 신고를 하지 않는다. 사람 확인을 요청한다.
+- 실데이터보다 가상 대상자와 팀원 번호로 PoC를 먼저 완료한다.
+
+
+8. 현재 폴더에서 남긴 파일
+========================
+
+.env
+  기존 비밀값과 프로젝트 설정 보호를 위해 내용 수정 없이 보존한다.
+
+.env.example
+  ClawOps 전화 모듈에 필요한 변수 이름만 보여주는 안전한 템플릿이다.
+
+scripts/provision_number.py
+  ClawOps 계정 키 확인, 보유 070 번호 조회·발급용 유틸리티다.
+
+CLAWOPS_PHONE_WORKFLOW.txt
+  전화 담당자의 단일 개발 기준 문서다.
+
+
+9. 근거 문서
+============
+
+Notion 최종 기획안
+https://app.notion.com/p/3bbfabb33afb8180946dcf57fb74fb62
+
+Notion 전화 상세 아이디어
+https://app.notion.com/p/3b8fabb33afb8074ab93fa62a1874157
+
+Notion Dispatcher 기획
+https://app.notion.com/p/3bbfabb33afb8126a6e3e9e56dadaaea
+
+ClawOps 공식 시작 가이드
+https://platform.claw-ops.com/docs/getting-started
+
+ClawOps 공식 Python SDK 문서
+https://platform.claw-ops.com/docs/sdk/python
+
+
+최종 우선순위
+=============
+
+1. 입력·출력 계약 고정
+2. 팀원 휴대전화 1건 실발신 성공
+3. 구조화 결과 정확성
+4. Spring 결과 저장과 지원 업무 생성
+5. 무응답 10분 1회 재시도
+6. 대시보드 데모 연결
+
+첫 실발신이 성공하기 전에는 대시보드나 고급 기능을 넓히지 않는다.
