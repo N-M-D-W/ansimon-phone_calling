@@ -345,6 +345,19 @@ Phase 6. 해커톤 데모
 scripts/provision_number.py
   ClawOps 계정 키 확인, 보유 070 번호 조회·발급용 유틸리티다.
 
+voice/call.py
+  입력된 번호로 한국어 예방 안내전화 1건을 발신한다.
+  OpenAI Realtime 사용. 통화 전사를 실시간 출력하고 종료 시
+  transcript_YYYYMMDD_HHMMSS.json 으로 저장한다.
+  음성 엔진 관련 내용은 10장 참고.
+
+voice/report.py
+  전사를 LLM 으로 판정해 §2.2 결과 본문을 만들고 Spring 에 전송한다.
+  LLM 교체(Alan 등)는 11장 참고.
+
+README.md
+  저장소용 문서. 필요한 API와 Spring 연동 계약을 정리했다.
+
 CLAWOPS_PHONE_WORKFLOW.txt
   전화 담당자의 단일 개발 기준 문서다.
 
@@ -366,6 +379,190 @@ https://platform.claw-ops.com/docs/getting-started
 
 ClawOps 공식 Python SDK 문서
 https://platform.claw-ops.com/docs/sdk/python
+
+
+10. 음성 엔진 — 현재 결정과 추후 방안
+=====================================
+
+10.1 현재 결정 (2026-08-14)
+---------------------------
+OpenAI Realtime 단일 모델로 진행한다.
+
+  OpenAIRealtime(system_prompt=PROMPT, language="ko", voice=VOICE)
+
+이유
+- STT·LLM·TTS가 한 모델 안에서 처리되어 지연이 가장 낮다.
+- semantic_vad(eagerness=low)가 기본 내장이라 천천히 말하는 고령자의
+  말끝을 자르지 않는다. 분리형에서는 이 동작을 직접 튜닝해야 한다.
+- 통화 전사(transcript)가 추가 비용·녹음 없이 나온다.
+- 붙일 API가 OpenAI 하나뿐이라 Phase 3(실발신 PoC)까지 가장 빠르다.
+
+바꿀 수 있는 것
+- 목소리: voice/call.py 상단 VOICE 상수
+  alloy ash ballad coral echo sage shimmer verse marin cedar (10종)
+- 말투·대화 순서: PROMPT 문자열
+- 말하는 속도를 직접 지정하는 파라미터는 없다. PROMPT로만 조절한다.
+
+한계 (추후 방안을 검토하게 된 이유)
+- 목소리가 10종으로 고정된다. 한국어 노년층 대상 음색을 고를 수 없다.
+- STT 모델(gpt-4o-transcribe)을 교체할 수 없다.
+  8kHz 전화 음질 + 느린 발화 + 사투리에서 인식률이 떨어져도 손댈 곳이 없다.
+
+
+10.2 추후 방안 — 분리형 PipelineSession
+---------------------------------------
+STT / LLM / TTS 를 각각 다른 제공자로 교체할 수 있는 구조.
+목소리 품질이나 한국어 인식률이 실통화에서 기준에 못 미칠 때 전환한다.
+
+전환 조건 (하나라도 해당하면 검토)
+- 어르신 발화 인식 실패가 반복되어 UNKNOWN 결과가 자주 나온다
+- 목소리가 어색하다는 피드백이 반복된다
+- VOICE 상수를 다 바꿔봐도 개선되지 않는다
+
+설치
+  pip install "clawops[agent,openai,deepgram,elevenlabs]"
+
+추가 환경변수
+  DEEPGRAM_API_KEY
+  ELEVENLABS_API_KEY
+
+코드 (voice/call.py 의 session= 인자만 교체)
+
+  from clawops.agent.pipeline import (
+      DeepgramSTT, ElevenLabsTTS, OpenAILLM, PipelineSession,
+  )
+
+  session = PipelineSession(
+      # 기본 endpointing=300ms 는 어르신 말끝을 자른다. 반드시 올려서 시작할 것.
+      stt=DeepgramSTT(language="ko", endpointing=800, utterance_end_ms=1500),
+      llm=OpenAILLM(model="gpt-4o"),          # 느리면 gpt-4o-mini
+      tts=ElevenLabsTTS(voice_id=EL_VOICE, language_code="ko"),
+      system_prompt=PROMPT,
+      language="ko",
+  )
+
+ElevenLabs 목소리는 Voice Library 에서 한국어 음성을 골라 voice_id 를 복사한다.
+SDK 기본값(EXAVITQu4vr4xnSDxMaL)은 영어권 음성이라 한국어에 맞지 않는다.
+  https://elevenlabs.io/app/voice-library
+
+전환 시 잃는 것 (반드시 인지할 것)
+- semantic_vad 가 사라진다. Deepgram endpointing 값으로 직접 맞춰야 하며,
+  이 값이 고령자 대화 품질을 가장 크게 좌우한다.
+- 지연이 직렬로 쌓인다. STT -> LLM 첫 토큰 -> TTS 순서로 더해진다.
+- 끼어들기(barge-in) 처리를 다시 확인해야 한다.
+
+
+10.3 그 다음 단계 — 한국어 특화 제공자
+--------------------------------------
+분리형으로도 부족하면 SDK 미포함 제공자를 직접 붙인다.
+두 프로토콜 모두 메서드가 하나뿐이라 어댑터는 40줄 내외다.
+
+  class STT(Protocol):
+      async def transcribe(self, audio_stream) -> AsyncIterator[SpeechEvent]: ...
+
+  class TTS(Protocol):
+      async def synthesize(self, text_stream) -> AsyncIterator[bytes]: ...   # PCM16
+
+후보
+- STT: 리턴제로 VITO — 한국어 특화. 자사 벤치마크 기준 CER 6.32%
+       (CLOVA Speech 9.49%). 8kHz LINEAR16 gRPC 스트리밍을 네이티브 지원해
+       전화 음질에 유리하다. 셀프 가입 + 무료 체험.
+       https://developers.rtzr.ai/docs/stt-streaming/grpc/
+- TTS: Cartesia Sonic 3.5 — 한국어 포함 42개 언어, sub-90ms 지연.
+       https://docs.cartesia.ai/build-with-cartesia/tts-models/latest
+
+주의: ClawOps 파이프라인은 전화 오디오를 8kHz -> 16kHz 로 업샘플링해서
+STT 에 넘긴다. 원본 정보가 늘어나지는 않는다.
+
+
+10.4 판단 기준
+--------------
+한국어 STT/TTS 의 독립 벤치마크는 사실상 존재하지 않는다.
+공개된 수치는 대부분 제공자 자사 발표이며, 영어 기준 상위권이
+2~5% WER 에 몰려 있다는 정도만 확인된다.
+
+따라서 제공자 선택은 문서 비교가 아니라 팀원 휴대전화 실통화로 결정한다.
+통화 종료 시 출력되는 다음 값을 근거로 삼는다.
+
+  종료 · 48초 · 사유 hang_up · 첫 응답 820ms · 끼어들기 2회
+
+- 첫 응답 ms 가 어르신 기준으로 견딜 만한가
+- transcript_*.json 에서 어르신 발화가 정확히 전사되었는가
+- 끼어들기 횟수가 비정상적으로 많지 않은가 (말을 자르고 있다는 신호)
+
+
+11. 통화 결과 정리 (LLM) — 현재 구현과 교체 지점
+=================================================
+
+11.1 흐름
+---------
+전사(transcript) -> LLM 판정 -> §2.2 결과 본문 -> Spring 전송
+
+  voice/report.py
+    summarize()    LLM 호출.        <- 교체 지점은 여기 하나뿐
+    coerce()       enum 강제 방어.   제공자를 바꿔도 유지한다
+    build_result() §2.2 본문 조립
+    send()         §2.3 멱등키 헤더로 Spring 전송
+
+LLM 이 판정하는 항목은 §2.2 의 네 개뿐이다.
+  shelterIntent / canMoveAlone / helpNeeded / symptomMentioned
+여기에 summary(2~3문장)와 confidence 를 더한다.
+
+contactStatus 는 LLM 이 정하지 않는다.
+  어르신 발화가 하나도 없으면 NO_ANSWER (LLM 호출 자체를 건너뛴다)
+  발화가 있으면 ANSWERED
+
+
+11.2 안전 장치
+--------------
+- LLM 출력이 YES/NO/UNKNOWN 이 아니면 coerce() 가 UNKNOWN 으로 바꾼다.
+  §2.2 "답을 듣지 못한 필드는 추측하지 않는다" 를 코드로 강제한 것이다.
+- LLM 호출이 실패해도 통화 결과를 잃지 않는다.
+  전 항목 UNKNOWN + contactStatus=ANSWERED 로 전송하고, Spring 이
+  §3-4 규칙에 따라 MEDIUM 수동 확인 업무를 만든다.
+- 결과 본문에 원본 전사를 넣지 않는다. transcriptRef 만 넣는다.
+- confidence 는 0.0~1.0 범위로 잘라낸다.
+
+
+11.3 Alan LLM API 로 교체하는 방법
+----------------------------------
+voice/report.py 의 summarize() 하나만 고친다. 다른 함수는 건드리지 않는다.
+
+  async def summarize(dialogue: str) -> dict:
+      # 입력: "어르신: ... / AI: ..." 형태의 대화 텍스트 한 덩어리
+      # 출력: shelterIntent, canMoveAlone, helpNeeded, symptomMentioned,
+      #       summary, confidence 를 담은 dict
+      ...Alan API 호출...
+      return json.loads(응답본문)
+
+지켜야 할 계약
+- 반환값은 dict 여야 한다. 값이 이상해도 coerce() 가 막으므로
+  Alan 이 JSON 을 완벽히 안 지켜도 서비스는 죽지 않는다.
+- SYSTEM 프롬프트는 그대로 재사용할 수 있다. 모델만 바꾸면 된다.
+- 모델명은 환경변수 SUMMARY_MODEL 로 분리해 두었다.
+
+교체 후 반드시 확인할 것
+- 저장된 전사로 재실행해 판정이 같은지 비교한다.
+    python voice/report.py transcript_YYYYMMDD_HHMMSS.json
+- 특히 "가고는 싶은데 혼자는 어려워" 같은 복합 답변에서
+  shelterIntent=YES / canMoveAlone=NO 로 갈리는지 본다.
+
+
+11.4 미확정 — 백엔드와 합의 필요
+---------------------------------
+아래는 문서(§5 Phase 0)에서 아직 확정되지 않아 임의로 정한 값이다.
+백엔드 담당자와 맞춘 뒤 report.py 의 send() 만 고치면 된다.
+
+  엔드포인트   POST {ANSIMON_BACKEND_BASE_URL}/api/contact-jobs/{id}/outcome
+  인증         Authorization: Bearer {ANSIMON_BACKEND_TOKEN}
+  멱등키       Idempotency-Key: {contactJobId}:{attemptNo}:call_result
+  본문         {"result": {...§2.2...}, "meta": {...운영 메타데이터...}}
+
+§2.2 는 "운영 메타데이터는 결과 본문과 분리해 함께 저장한다" 고만 적혀 있어
+result / meta 두 객체로 나눠 보낸다. 백엔드가 평탄한 구조를 원하면 합의 후 바꾼다.
+
+ANSIMON_BACKEND_BASE_URL 이 비어 있으면 전송하지 않고 payload 를 출력만 한다.
+백엔드가 준비되기 전에도 형식을 눈으로 확인할 수 있다.
 
 
 최종 우선순위
